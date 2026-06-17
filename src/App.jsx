@@ -48,31 +48,68 @@ import {
   collection
 } from 'firebase/firestore';
 
+// Helper to safely access environmental variables without triggering compile-time target warnings in older ES environments
+const getSafeEnv = (key) => {
+  try {
+    // Dynamic execution hides the access statement from build-time static analyzers
+    const meta = new Function('return import.meta')();
+    return meta && meta.env ? meta.env[key] : '';
+  } catch (e) {
+    // Direct static fallback if execution environment blocks dynamic evaluation
+    try {
+      return import.meta.env[key] || '';
+    } catch (err) {
+      return '';
+    }
+  }
+};
+
+// Robust helper to sanitize environmental keys (removes accidental wrapping quotes, colons, commas, spaces)
+const sanitizeConfigVal = (val) => {
+  if (!val) return "";
+  return val
+    .trim()
+    .replace(/^["']|["']$/g, '') // Strip wrapping single or double quotes
+    .replace(/[,;]$/, '')        // Strip trailing commas or semicolons
+    .trim();
+};
+
 let firebaseConfig = null;
 
 // Read config from system injects or Vercel environment variables
 if (typeof __firebase_config !== 'undefined' && __firebase_config) {
   try {
-    firebaseConfig = JSON.parse(__firebase_config);
+    const parsed = JSON.parse(__firebase_config);
+    firebaseConfig = {
+      apiKey: sanitizeConfigVal(parsed.apiKey),
+      authDomain: sanitizeConfigVal(parsed.authDomain),
+      projectId: sanitizeConfigVal(parsed.projectId),
+      storageBucket: sanitizeConfigVal(parsed.storageBucket),
+      messagingSenderId: sanitizeConfigVal(parsed.messagingSenderId),
+      appId: sanitizeConfigVal(parsed.appId)
+    };
   } catch (e) {
     console.error("Error parsing environment config: ", e);
   }
 } else {
-  // Read Vite env variables configured via Vercel / local .env
+  // Read Vite env variables configured via Vercel / local .env and sanitize them
   firebaseConfig = {
-    apiKey: import.meta.env.VITE_FIREBASE_API_KEY || "",
-    authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || "",
-    projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || "",
-    storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || "",
-    messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || "",
-    appId: import.meta.env.VITE_FIREBASE_APP_ID || ""
+    apiKey: sanitizeConfigVal(getSafeEnv('VITE_FIREBASE_API_KEY')),
+    authDomain: sanitizeConfigVal(getSafeEnv('VITE_FIREBASE_AUTH_DOMAIN')),
+    projectId: sanitizeConfigVal(getSafeEnv('VITE_FIREBASE_PROJECT_ID')),
+    storageBucket: sanitizeConfigVal(getSafeEnv('VITE_FIREBASE_STORAGE_BUCKET')),
+    messagingSenderId: sanitizeConfigVal(getSafeEnv('VITE_FIREBASE_MESSAGING_SENDER_ID')),
+    appId: sanitizeConfigVal(getSafeEnv('VITE_FIREBASE_APP_ID'))
   };
 }
 
 let app = null;
 let auth = null;
 let db = null;
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'powerlog-energy-audit';
+
+// Clean appId: Replace any slashes with underscores so Firestore doesn't count them as extra collection segments
+const appIdRaw = typeof __app_id !== 'undefined' ? __app_id : 'powerlog-energy-audit';
+const appId = appIdRaw.replace(/\//g, '_');
 
 // Only initialize if we have a valid configuration setup
 if (firebaseConfig && firebaseConfig.apiKey) {
@@ -1598,6 +1635,6 @@ export default function App() {
           </div>
         </div>
       </footer>
-    </div>  
+    </div>
   );
 }
