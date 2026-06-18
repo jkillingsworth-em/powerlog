@@ -27,7 +27,8 @@ import {
   Lock,
   ChevronRight,
   ShieldCheck,
-  Smartphone
+  Smartphone,
+  FileSpreadsheet
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { 
@@ -235,10 +236,20 @@ export default function App() {
   const [newAppName, setNewAppName] = useState('');
   const [newAppWattage, setNewAppWattage] = useState('');
   const [newAppCategory, setNewAppCategory] = useState('Kitchen');
+  
+  // Manual Log Mode ('range' = Calculate from start/end dates, 'duration' = input raw minutes)
+  const [manualLogMode, setManualLogMode] = useState('range');
   const [logApplianceId, setLogApplianceId] = useState('');
-  const [logDate, setLogDate] = useState(formatDate(new Date()));
+  
+  // States for Range Mode calculation
+  const [logStartDate, setLogStartDate] = useState(formatDate(new Date()));
   const [logStartTime, setLogStartTime] = useState('12:00');
+  const [logEndDate, setLogEndDate] = useState(formatDate(new Date()));
+  const [logEndTime, setLogEndTime] = useState('13:00');
+  
+  // Raw state if user chooses to directly insert minutes
   const [logDuration, setLogDuration] = useState('');
+  
   const [utilDate, setUtilDate] = useState(formatDate(new Date()));
   const [utilKwh, setUtilKwh] = useState('');
   const [csvText, setCsvText] = useState('');
@@ -567,30 +578,91 @@ export default function App() {
     triggerNotification(`Saved active run: logged ${durationMins}m for ${appObj.name}!`);
   };
 
+  // Live Auto-Calculation for manual log entries based on range
+  const autoCalculatedDuration = useMemo(() => {
+    if (manualLogMode !== 'range') return { minutes: 0, text: '', error: null };
+    if (!logStartDate || !logStartTime || !logEndDate || !logEndTime) {
+      return { minutes: 0, text: '', error: 'Missing start/end values' };
+    }
+
+    const startObj = new Date(`${logStartDate}T${logStartTime}`);
+    const endObj = new Date(`${logEndDate}T${logEndTime}`);
+
+    if (isNaN(startObj.getTime()) || isNaN(endObj.getTime())) {
+      return { minutes: 0, text: '', error: 'Invalid dates or times' };
+    }
+
+    const diffMs = endObj.getTime() - startObj.getTime();
+    if (diffMs < 0) {
+      return { minutes: 0, text: '', error: 'End date/time must be after start date/time' };
+    }
+
+    const totalMinutes = Math.floor(diffMs / 60000);
+    
+    // Formatting into Days, Hours, Minutes
+    const d = Math.floor(totalMinutes / (24 * 60));
+    const h = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const m = totalMinutes % 60;
+
+    let friendlyText = '';
+    if (d > 0) friendlyText += `${d} day${d > 1 ? 's' : ''}, `;
+    if (h > 0 || d > 0) friendlyText += `${h} hour${h > 1 ? 's' : ''}, `;
+    friendlyText += `${m} minute${m !== 1 ? 's' : ''}`;
+
+    return {
+      minutes: totalMinutes,
+      text: friendlyText,
+      error: null
+    };
+  }, [manualLogMode, logStartDate, logStartTime, logEndDate, logEndTime]);
+
   const handleManualLog = (e) => {
     e.preventDefault();
-    if (!logApplianceId || !logDate || !logStartTime || !logDuration) {
-      triggerNotification('Please specify all required run inputs.', 'error');
+    if (!logApplianceId) {
+      triggerNotification('Please select an appliance.', 'error');
       return;
     }
 
-    const durationMins = parseInt(logDuration);
-    if (isNaN(durationMins) || durationMins <= 0) {
-      triggerNotification('Duration must be greater than zero.', 'error');
+    let finalDurationMins = 0;
+    let finalDate = logStartDate;
+    let finalStartTime = logStartTime;
+
+    if (manualLogMode === 'range') {
+      if (autoCalculatedDuration.error) {
+        triggerNotification(autoCalculatedDuration.error, 'error');
+        return;
+      }
+      finalDurationMins = autoCalculatedDuration.minutes;
+      finalDate = logStartDate;
+      finalStartTime = logStartTime;
+    } else {
+      // Direct raw minutes mode
+      const rawMins = parseInt(logDuration);
+      if (isNaN(rawMins) || rawMins <= 0) {
+        triggerNotification('Duration must be greater than zero.', 'error');
+        return;
+      }
+      finalDurationMins = rawMins;
+      finalDate = logStartDate; // use default start date
+      finalStartTime = logStartTime;
+    }
+
+    if (finalDurationMins <= 0) {
+      triggerNotification('Invalid run duration computed.', 'error');
       return;
     }
 
     const appObj = appliances.find(a => a.id === logApplianceId);
     if (!appObj) return;
 
-    const calculatedKwh = parseFloat(((appObj.wattage * (durationMins / 60)) / 1000).toFixed(4));
+    const calculatedKwh = parseFloat(((appObj.wattage * (finalDurationMins / 60)) / 1000).toFixed(4));
 
     const newLog = {
       id: `log-${Date.now()}`,
       applianceId: logApplianceId,
-      date: logDate,
-      startTime: logStartTime,
-      duration: durationMins,
+      date: finalDate,
+      startTime: finalStartTime,
+      duration: finalDurationMins,
       kwh: calculatedKwh
     };
 
@@ -600,8 +672,9 @@ export default function App() {
       setLogs(prev => [newLog, ...prev]);
     }
 
+    // Reset fields cleanly
     setLogDuration('');
-    triggerNotification(`Manually saved ${appObj.name} run of ${durationMins} minutes.`);
+    triggerNotification(`Manually saved ${appObj.name} run of ${finalDurationMins} minutes.`);
   };
 
   const handleDeleteLog = (id) => {
@@ -666,56 +739,152 @@ export default function App() {
     );
   };
 
-  const handleCsvImport = (e) => {
+  // Safe CSV parser that respects commas, quoted values, and matches utility schemas dynamically
+  const parseUtilityCSV = (text) => {
+    const lines = text.split(/\r?\n/);
+    if (lines.length === 0) return [];
+
+    const firstLine = lines[0];
+    const headers = firstLine.split(',').map(h => h.trim().toUpperCase());
+
+    // Search header names dynamically to support standard formats as well as user's 5-17-6-17.csv structure
+    let dateIdx = headers.findIndex(h => h.includes('TIMESTAMP') || h.includes('DATE') || h.includes('TIME'));
+    let energyIdx = headers.findIndex(h => h.includes('TOTALENERGY') || h.includes('ENERGY') || h.includes('KWH') || h.includes('USAGE') || h.includes('QTY'));
+
+    // Secure fallback index placements
+    if (dateIdx === -1) dateIdx = 0;
+    if (energyIdx === -1) energyIdx = 2; // Col 3 in standard exports containing TotalEnergy
+
+    const entries = [];
+
+    // Custom helper to split by comma while safely ignoring commas locked inside double-quotes (marker notes, descriptive fields)
+    const splitCSVLine = (lineStr) => {
+      const result = [];
+      let cur = '';
+      let inQuotes = false;
+      for (let i = 0; i < lineStr.length; i++) {
+        const char = lineStr[i];
+        if (char === '"') {
+          inQuotes = !inQuotes;
+        } else if (char === ',' && !inQuotes) {
+          result.push(cur);
+          cur = '';
+        } else {
+          cur += char;
+        }
+      }
+      result.push(cur);
+      return result;
+    };
+
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+
+      const cols = splitCSVLine(line);
+      if (cols.length > Math.max(dateIdx, energyIdx)) {
+        const rawDate = cols[dateIdx].trim();
+        const rawKwh = cols[energyIdx].trim();
+
+        let formattedDate = null;
+        
+        // Formatter 1: MM/DD/YYYY
+        if (rawDate.includes('/')) {
+          const parts = rawDate.split('/');
+          if (parts.length === 3) {
+            let [m, d, y] = parts;
+            if (m.length === 4) { // Handle YYYY/MM/DD
+              formattedDate = `${m}-${d.padStart(2, '0')}-${y.padStart(2, '0')}`;
+            } else { // Handle MM/DD/YYYY
+              formattedDate = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+            }
+          }
+        } 
+        // Formatter 2: YYYY-MM-DD
+        else if (rawDate.includes('-')) {
+          const parts = rawDate.split('-');
+          if (parts.length === 3) {
+            if (parts[0].length === 4) {
+              formattedDate = rawDate;
+            } else { // Handle MM-DD-YYYY
+              let [m, d, y] = parts;
+              formattedDate = `${y}-${m.padStart(2, '0')}-${d.padStart(2, '0')}`;
+            }
+          }
+        }
+
+        const kwhNum = parseFloat(rawKwh);
+        if (formattedDate && formattedDate.match(/^\d{4}-\d{2}-\d{2}$/) && !isNaN(kwhNum)) {
+          entries.push({
+            id: formattedDate,
+            date: formattedDate,
+            kwh: kwhNum,
+            source: 'CSV Import'
+          });
+        }
+      }
+    }
+    return entries;
+  };
+
+  // CSV file input change listener
+  const handleCSVFileChange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      const text = event.target.result;
+      const importedEntries = parseUtilityCSV(text);
+
+      if (importedEntries.length === 0) {
+        triggerNotification('Failed to detect any valid reading rows. Ensure CSV uses standard headers.', 'error');
+        return;
+      }
+
+      if (user && db) {
+        // Upload immediately to FireStore if synced
+        for (const entry of importedEntries) {
+          await pushUtility(entry);
+        }
+      } else {
+        // Merge into local states overriding duplicates
+        setUtilityData(prev => {
+          const cleaned = prev.filter(p => !importedEntries.some(imp => imp.date === p.date));
+          return [...cleaned, ...importedEntries].sort((a,b) => b.date.localeCompare(a.date));
+        });
+      }
+      triggerNotification(`Successfully processed "${file.name}": Imported ${importedEntries.length} daily readings!`, 'success');
+    };
+    reader.readAsText(file);
+    // Clear input so same file can be uploaded again
+    e.target.value = '';
+  };
+
+  const handleCsvTextImport = (e) => {
     e.preventDefault();
     if (!csvText.trim()) {
       triggerNotification('Please paste valid CSV contents before compiling.', 'error');
       return;
     }
 
-    const lines = csvText.split('\n');
-    let successCount = 0;
-
-    lines.forEach(line => {
-      const cols = line.split(/[,\t]/);
-      if (cols.length >= 2) {
-        const rawDate = cols[0].trim();
-        const rawKwh = cols[1].trim();
-
-        const dateMatch = rawDate.match(/^\d{4}-\d{2}-\d{2}$/);
-        const kwhNum = parseFloat(rawKwh);
-
-        if (dateMatch && !isNaN(kwhNum)) {
-          const entry = {
-            id: rawDate,
-            date: rawDate,
-            kwh: kwhNum,
-            source: 'CSV Upload'
-          };
-          if (user && db) {
-            pushUtility(entry);
-          } else {
-            setUtilityData(prev => {
-              const cleaned = prev.filter(d => d.date !== rawDate);
-              return [...cleaned, entry];
-            });
-          }
-          successCount++;
-        }
-      }
-    });
-
-    if (successCount === 0) {
-      triggerNotification('Format incorrect. Use lines with YYYY-MM-DD, kWh pairs.', 'error');
+    const importedEntries = parseUtilityCSV(csvText);
+    if (importedEntries.length === 0) {
+      triggerNotification('Failed to parse rows. Use line formats matching: Date, kWh.', 'error');
       return;
     }
 
-    if (!user || !db) {
-      setUtilityData(prev => [...prev].sort((a, b) => b.date.localeCompare(a.date)));
+    if (user && db) {
+      importedEntries.forEach(entry => pushUtility(entry));
+    } else {
+      setUtilityData(prev => {
+        const cleaned = prev.filter(p => !importedEntries.some(imp => imp.date === p.date));
+        return [...cleaned, ...importedEntries].sort((a, b) => b.date.localeCompare(a.date));
+      });
     }
 
     setCsvText('');
-    triggerNotification(`Processed bulk records: ${successCount} entries compiled!`);
+    triggerNotification(`Processed paste: compiled ${importedEntries.length} daily statements!`);
   };
 
   const handleAutoGenerateUtility = () => {
@@ -1342,27 +1511,155 @@ export default function App() {
                 </div>
               </div>
 
-              {/* MANUAL LOGGER */}
+              {/* MANUAL LOGGER WITH DURATION AUTO CALCULATE FUNCTION */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                <h3 className="text-md font-bold text-slate-100 mb-4">Manual Run Logger</h3>
-                <form onSubmit={handleManualLog} className="space-y-4">
-                  <select
-                    value={logApplianceId}
-                    onChange={(e) => setLogApplianceId(e.target.value)}
-                    required
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200"
-                  >
-                    <option value="">-- Choose Appliance --</option>
-                    {appliances.map(app => <option key={app.id} value={app.id}>{app.name} ({app.wattage}W)</option>)}
-                  </select>
+                <h3 className="text-md font-bold text-slate-100 mb-2 flex items-center justify-between">
+                  <span>Manual Run Logger</span>
+                  <div className="flex bg-slate-950 rounded-lg p-0.5 border border-slate-800">
+                    <button
+                      type="button"
+                      onClick={() => setManualLogMode('range')}
+                      className={`px-2 py-0.5 text-[10px] font-bold rounded transition-all ${manualLogMode === 'range' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}
+                    >
+                      Time Range
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setManualLogMode('duration')}
+                      className={`px-2 py-0.5 text-[10px] font-bold rounded transition-all ${manualLogMode === 'duration' ? 'bg-emerald-500 text-slate-950' : 'text-slate-400'}`}
+                    >
+                      Raw Mins
+                    </button>
+                  </div>
+                </h3>
+                <p className="text-[11px] text-slate-400 mb-4">
+                  {manualLogMode === 'range' 
+                    ? 'Enter starting and ending timestamps to automatically calculate duration.' 
+                    : 'Input running time directly in total minutes.'}
+                </p>
 
-                  <div className="grid grid-cols-2 gap-3">
-                    <input type="date" value={logDate} onChange={(e) => setLogDate(e.target.value)} required className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs" />
-                    <input type="time" value={logStartTime} onChange={(e) => setLogStartTime(e.target.value)} required className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs" />
+                <form onSubmit={handleManualLog} className="space-y-4">
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-400 mb-1">Target Appliance</label>
+                    <select
+                      value={logApplianceId}
+                      onChange={(e) => setLogApplianceId(e.target.value)}
+                      required
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200"
+                    >
+                      <option value="">-- Choose Appliance --</option>
+                      {appliances.map(app => <option key={app.id} value={app.id}>{app.name} ({app.wattage}W)</option>)}
+                    </select>
                   </div>
 
-                  <input type="number" placeholder="Duration (mins)" value={logDuration} onChange={(e) => setLogDuration(e.target.value)} required className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm" />
-                  <button type="submit" className="w-full py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-extrabold rounded-lg">Save Run Log Entry</button>
+                  {manualLogMode === 'range' ? (
+                    <div className="space-y-3">
+                      {/* START RANGE */}
+                      <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-850">
+                        <span className="text-[10px] font-bold text-emerald-400 block mb-1">STARTING TIMESTAMP</span>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="block text-[9px] text-slate-500 uppercase">Date</label>
+                            <input 
+                              type="date" 
+                              value={logStartDate} 
+                              onChange={(e) => setLogStartDate(e.target.value)} 
+                              required 
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-300 font-mono" 
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[9px] text-slate-500 uppercase">Time</label>
+                            <input 
+                              type="time" 
+                              value={logStartTime} 
+                              onChange={(e) => setLogStartTime(e.target.value)} 
+                              required 
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-300 font-mono" 
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* END RANGE */}
+                      <div className="p-3 bg-slate-950/60 rounded-xl border border-slate-850">
+                        <span className="text-[10px] font-bold text-rose-400 block mb-1">ENDING TIMESTAMP</span>
+                        <div className="grid grid-cols-2 gap-2">
+                          <div>
+                            <label className="block text-[9px] text-slate-500 uppercase">Date</label>
+                            <input 
+                              type="date" 
+                              value={logEndDate} 
+                              onChange={(e) => setLogEndDate(e.target.value)} 
+                              required 
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-300 font-mono" 
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-[9px] text-slate-500 uppercase">Time</label>
+                            <input 
+                              type="time" 
+                              value={logEndTime} 
+                              onChange={(e) => setLogEndTime(e.target.value)} 
+                              required 
+                              className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-300 font-mono" 
+                            />
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* LIVE CALCULATOR DISPLAY PREVIEW */}
+                      <div className="p-3 bg-slate-950 rounded-xl border border-slate-800">
+                        <span className="text-[10px] font-bold text-slate-500 uppercase block mb-1">AUTO CALCULATED DURATION</span>
+                        {autoCalculatedDuration.error ? (
+                          <div className="flex items-center gap-1.5 text-xs text-rose-400 mt-1">
+                            <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                            <span>{autoCalculatedDuration.error}</span>
+                          </div>
+                        ) : (
+                          <div className="space-y-1">
+                            <p className="text-sm font-bold text-emerald-400 font-mono">
+                              {autoCalculatedDuration.text}
+                            </p>
+                            <p className="text-[10px] text-slate-500">
+                              Total Equivalent Time: <strong className="font-mono text-slate-300">{autoCalculatedDuration.minutes}</strong> minutes
+                            </p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">Logging Date</label>
+                        <input 
+                          type="date" 
+                          value={logStartDate} 
+                          onChange={(e) => setLogStartDate(e.target.value)} 
+                          required 
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono" 
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-[11px] font-medium text-slate-400 mb-1">Run Duration (minutes)</label>
+                        <input 
+                          type="number" 
+                          placeholder="Duration (mins)" 
+                          value={logDuration} 
+                          onChange={(e) => setLogDuration(e.target.value)} 
+                          required 
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200" 
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <button 
+                    type="submit" 
+                    className="w-full py-2.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-extrabold rounded-lg transition"
+                  >
+                    Save Run Log Entry
+                  </button>
                 </form>
               </div>
             </div>
@@ -1387,11 +1684,21 @@ export default function App() {
                     <tbody className="divide-y divide-slate-850 text-xs">
                       {logs.map((log) => {
                         const app = appliances.find(a => a.id === log.applianceId);
+                        
+                        // Human readable conversion of stored minutes in ledger
+                        const d = Math.floor(log.duration / (24 * 60));
+                        const h = Math.floor((log.duration % (24 * 60)) / 60);
+                        const m = log.duration % 60;
+                        let durationLabel = '';
+                        if (d > 0) durationLabel += `${d}d `;
+                        if (h > 0 || d > 0) durationLabel += `${h}h `;
+                        durationLabel += `${m}m`;
+
                         return (
                           <tr key={log.id} className="hover:bg-slate-900/50 transition">
                             <td className="px-6 py-3 font-mono">{log.date}</td>
                             <td className="px-6 py-3 font-bold">{app ? app.name : 'Legacy Item'}</td>
-                            <td className="px-6 py-3 text-right font-mono">{log.duration} mins</td>
+                            <td className="px-6 py-3 text-right font-mono" title={`${log.duration} minutes total`}>{durationLabel}</td>
                             <td className="px-6 py-3 text-right font-mono text-emerald-400 font-bold">{log.kwh.toFixed(3)}</td>
                             <td className="px-6 py-3 text-center">
                               <button onClick={() => handleDeleteLog(log.id)} className="text-slate-500 hover:text-rose-400"><Trash2 className="w-4 h-4" /></button>
@@ -1462,10 +1769,42 @@ export default function App() {
             </div>
 
             <div className="lg:col-span-2 space-y-6">
+              
+              {/* CSV AUTO IMPORT ZONE */}
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
-                <h3 className="text-md font-bold text-slate-100 mb-2">Bulk CSV Import</h3>
-                <form onSubmit={handleCsvImport} className="space-y-4">
-                  <textarea rows="4" placeholder="YYYY-MM-DD, kWh (one per line)" value={csvText} onChange={(e) => setCsvText(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono text-slate-300"></textarea>
+                <h3 className="text-md font-bold text-slate-100 mb-1 flex items-center gap-2">
+                  <FileSpreadsheet className="text-emerald-400 w-5 h-5" />
+                  Utility CSV File Upload
+                </h3>
+                <p className="text-xs text-slate-400 mb-5">
+                  Select or drop your power company's daily consumption spreadsheet. Your uploaded column schema (like <code>DAILYTIMESTAMPFORMAT</code> & <code>TOTALENERGY</code>) is parsed automatically.
+                </p>
+
+                {/* Upload Button Component */}
+                <div className="relative">
+                  <input 
+                    type="file" 
+                    id="csv-file-input" 
+                    accept=".csv" 
+                    onChange={handleCSVFileChange}
+                    className="hidden" 
+                  />
+                  <label 
+                    htmlFor="csv-file-input"
+                    className="flex flex-col items-center justify-center border-2 border-dashed border-slate-700 hover:border-emerald-500/50 bg-slate-950 hover:bg-slate-900/60 transition-all cursor-pointer p-8 rounded-xl text-center group"
+                  >
+                    <Upload className="w-8 h-8 text-slate-500 group-hover:text-emerald-400 transition mb-2" />
+                    <span className="text-xs font-bold text-slate-300 group-hover:text-emerald-300">Choose CSV Spreadsheet File</span>
+                    <span className="text-[10px] text-slate-500 mt-1 font-mono">Supports your billing logs (e.g. 5-17-6-17.csv)</span>
+                  </label>
+                </div>
+              </div>
+
+              {/* BULK TEXT INPUT ALTERNATIVE */}
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+                <h3 className="text-md font-bold text-slate-100 mb-2">Alternative: Paste CSV Content</h3>
+                <form onSubmit={handleCsvTextImport} className="space-y-4">
+                  <textarea rows="4" placeholder="DAILYTIMESTAMPFORMAT,TOTALENERGY&#10;05/17/2026,68&#10;05/18/2026,67" value={csvText} onChange={(e) => setCsvText(e.target.value)} className="w-full bg-slate-950 border border-slate-700 rounded-lg p-3 text-xs font-mono text-slate-300 focus:outline-none focus:border-emerald-500"></textarea>
                   <button type="submit" className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-400 font-bold text-xs rounded-lg border border-slate-700">Process CSV</button>
                 </form>
               </div>
